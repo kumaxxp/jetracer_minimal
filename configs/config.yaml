@@ -1,0 +1,15 @@
+camera:
+  width: 320
+  height: 240
+  fps: 30
+  device: 0
+
+model:
+  path: models/dummy_segmentation_320x240.onnx
+  input_size: [320, 240]
+
+segmentation:
+  road_classes: [0, 1]
+
+display:
+  overlay_alpha: 0.4
