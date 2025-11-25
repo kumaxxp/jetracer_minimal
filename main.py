@@ -45,7 +45,11 @@ def main() -> None:
     monitor = PerformanceMonitor()
 
     print("Setting up web interface...")
-    web_ui = WebUI(camera, model, monitor)
+    display_config = dict(config.get("display", {}))
+    segmentation_cfg = config.get("segmentation", {})
+    if "interval" in segmentation_cfg and "segmentation_interval" not in display_config:
+        display_config["segmentation_interval"] = segmentation_cfg["interval"]
+    web_ui = WebUI(camera, model, monitor, display_config)
     web_ui.setup_ui()
 
     print("\n" + "=" * 60)

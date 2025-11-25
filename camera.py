@@ -33,7 +33,7 @@ class JetCamera:
         sensor_mode: int | None = None,
         capture_width: int | None = 1280,
         capture_height: int | None = 720,
-        capture_fps: int | None = 60,
+        capture_fps: int | None = None,
         flip_method: int = 0,
     ) -> None:
         self.width = width

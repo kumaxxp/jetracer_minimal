@@ -1,7 +1,7 @@
 camera:
-  width: 1280
-  height: 720
-  fps: 60
+  width: 640
+  height: 480
+  fps: 15
   device: 0  # CSI Camera ID
 
 model:
@@ -12,8 +12,13 @@ model:
 segmentation:
   road_classes: [0, 1]  # Cityscapes: road, sidewalk
   threshold: 0.5
+  interval: 10
 
 display:
   enable_ui: true
   show_fps: true
-  overlay_mask: true
+  overlay_mask: false
+  overlay_alpha: 0.4
+  jpeg_quality: 80
+  target_fps: 10
+  display_fps: 10

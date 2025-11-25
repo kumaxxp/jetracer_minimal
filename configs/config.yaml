@@ -1,15 +1,24 @@
 camera:
-  width: 320
-  height: 240
-  fps: 30
+  width: 640
+  height: 480
+  fps: 15
   device: 0
 
 model:
-  path: models/dummy_segmentation_320x240.onnx
-  input_size: [320, 240]
+  type: opencv_dnn
+  path: models/dummy_segmentation_640x480.onnx
+  input_size: [640, 480]
 
 segmentation:
-  road_classes: [0, 1]
+  road_classes: [0, 1, 7]
+  threshold: 0.5
+  interval: 10
 
 display:
+  enable_ui: true
+  show_fps: true
+  overlay_mask: false
   overlay_alpha: 0.4
+  jpeg_quality: 80
+  target_fps: 10
+  display_fps: 10

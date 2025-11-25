@@ -5,30 +5,51 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
 from nicegui import ui
+import yaml
 
 
 class WebUI:
     """Optimized NiceGUI web interface."""
 
-    def __init__(self, camera, model, monitor) -> None:
+    def __init__(
+        self,
+        camera,
+        model,
+        monitor,
+        display_config: Mapping[str, Any] | None = None,
+    ) -> None:
         self.camera = camera
         self.model = model
         self.monitor = monitor
+        self.display_config = dict(display_config or {})
+        config = self.display_config
         self.running = False
-        self.overlay_enabled = True
-        self.overlay_alpha = 0.4
+        self.stream_only_mode = bool(config.get("stream_only_mode", True))
+        overlay_default = bool(config.get("overlay_mask", False))
+        self.overlay_enabled = overlay_default and not self.stream_only_mode
+        self.overlay_alpha = float(config.get("overlay_alpha", 0.4))
         self.frame_send_count = 0
         self.process_task: asyncio.Task | None = None
 
         # Frame rate control
-        self.target_display_fps = 20
+        default_fps = float(config.get("target_fps", config.get("display_fps", 10)) or 10)
+        self.target_display_fps = max(5.0, min(20.0, default_fps))
         self.last_send_time = 0.0
         self.min_send_interval = 1.0 / self.target_display_fps
+
+        # JPEG quality control
+        self.jpeg_quality = int(config.get("jpeg_quality", 80))
+        self.jpeg_quality = min(95, max(50, self.jpeg_quality))
+        self.segmentation_interval = max(1, int(config.get("segmentation_interval", 10)))
+        self.frame_process_count = 0
+        self.last_mask: np.ndarray | None = None
+        self._force_segmentation = False
 
         # UI components
         self.video_container = None
@@ -39,9 +60,17 @@ class WebUI:
         self.memory_label = None
         self.frames_label = None
         self.status_label = None
+        self.quality_slider = None
+        self.segmentation_slider = None
+        self.overlay_switch = None
+        self.stream_only_checkbox = None
+        self._suppress_overlay_event = False
         self._canvas_script_added = False
 
-        print(f"[WebUI] Initialized (target display FPS: {self.target_display_fps})")
+        print(
+            "[WebUI] Initialized "
+            f"(display FPS: {self.target_display_fps}, JPEG: {self.jpeg_quality})"
+        )
 
     def setup_ui(self) -> None:
         """Setup optimized NiceGUI interface."""
@@ -87,29 +116,56 @@ class WebUI:
                         on_click=self.toggle_processing,
                     ).props("color=green size=lg")
 
+                    self.stream_only_checkbox = ui.checkbox(
+                        "Stream Only (No Segmentation)",
+                        value=self.stream_only_mode,
+                        on_change=lambda e: self.set_stream_only(e.value),
+                    )
+
                     ui.separator().props("vertical")
 
                     with ui.row().classes("items-center gap-2"):
                         ui.label("Display FPS:")
                         self.fps_slider = ui.slider(
                             min=5,
-                            max=30,
+                            max=20,
                             step=5,
-                            value=20,
+                            value=self.target_display_fps,
                             on_change=self.update_target_fps,
                         ).props("label").classes("w-40")
-                        ui.label("20 FPS").bind_text_from(
+                        ui.label(f"{int(self.target_display_fps)} FPS").bind_text_from(
                             self.fps_slider,
                             "value",
                             backward=lambda v: f"{int(v)} FPS",
                         )
 
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label("Seg Interval:")
+                        self.segmentation_slider = (
+                            ui.slider(
+                                min=1,
+                                max=30,
+                                step=1,
+                                value=self.segmentation_interval,
+                                on_change=self.update_segmentation_interval,
+                            )
+                            .props("label")
+                            .classes("w-40")
+                        )
+                        ui.label("Every 10 frames").bind_text_from(
+                            self.segmentation_slider,
+                            "value",
+                            backward=lambda v: "Every frame"
+                            if int(v) == 1
+                            else f"Every {int(v)} frames",
+                        )
+
                     ui.separator().props("vertical")
 
-                    ui.switch(
+                    self.overlay_switch = ui.switch(
                         "Segmentation Overlay",
-                        value=True,
-                        on_change=lambda e: self.set_overlay(e.value),
+                        value=self.overlay_enabled,
+                        on_change=lambda e: self._handle_overlay_change(e.value),
                     )
 
                     with ui.row().classes("items-center gap-2"):
@@ -118,9 +174,28 @@ class WebUI:
                             min=0.0,
                             max=1.0,
                             step=0.1,
-                            value=0.4,
+                            value=self.overlay_alpha,
                             on_change=lambda e: setattr(self, "overlay_alpha", e.value),
                         ).props("label").classes("w-32")
+
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label("JPEG Quality:")
+                        self.quality_slider = (
+                            ui.slider(
+                                min=50,
+                                max=95,
+                                step=5,
+                                value=self.jpeg_quality,
+                                on_change=lambda e: setattr(self, "jpeg_quality", int(e.value)),
+                            )
+                            .props("label")
+                            .classes("w-32")
+                        )
+                        ui.label(str(self.jpeg_quality)).bind_text_from(
+                            self.quality_slider,
+                            "value",
+                            backward=lambda v: str(int(v)),
+                        )
 
             # Performance stats
             with ui.card().classes("w-full max-w-4xl"):
@@ -151,9 +226,16 @@ class WebUI:
 
     def update_target_fps(self, e: Any) -> None:
         """Update target display FPS."""
-        self.target_display_fps = max(1, float(e.value))
+        value = max(5.0, min(20.0, float(e.value)))
+        self.target_display_fps = value
         self.min_send_interval = 1.0 / self.target_display_fps
         print(f"[WebUI] Display FPS: {self.target_display_fps}")
+
+    def update_segmentation_interval(self, e: Any) -> None:
+        """Update how often segmentation runs."""
+        self.segmentation_interval = max(1, int(e.value))
+        self._force_segmentation = True
+        print(f"[WebUI] Segmentation interval: {self.segmentation_interval}")
 
     def toggle_processing(self) -> None:
         """Toggle start/stop."""
@@ -175,6 +257,9 @@ class WebUI:
         self.running = True
         self.frame_send_count = 0
         self.last_send_time = 0.0
+        self.frame_process_count = 0
+        self.last_mask = None
+        self._force_segmentation = True
 
         if self.start_button is not None:
             self.start_button.props("color=red")
@@ -211,8 +296,34 @@ class WebUI:
 
     def set_overlay(self, enabled: bool) -> None:
         """Toggle overlay."""
+        if self.overlay_switch is not None and self.overlay_switch.value != enabled:
+            self._suppress_overlay_event = True
+            self.overlay_switch.value = enabled
+            self._suppress_overlay_event = False
         self.overlay_enabled = enabled
+        if enabled:
+            self.stream_only_mode = False
+            if self.stream_only_checkbox is not None:
+                self.stream_only_checkbox.value = False
+            self._force_segmentation = True
+        else:
+            self.last_mask = None
         print(f"[WebUI] Overlay: {enabled}")
+
+    def set_stream_only(self, enabled: bool) -> None:
+        """Toggle stream-only mode."""
+        self.stream_only_mode = enabled
+        if enabled and self.overlay_enabled:
+            self.set_overlay(False)
+        if not enabled:
+            print("[WebUI] Stream-only mode OFF (processing enabled)")
+        else:
+            print("[WebUI] Stream-only mode ON (max performance)")
+
+    def _handle_overlay_change(self, value: bool) -> None:
+        if self._suppress_overlay_event:
+            return
+        self.set_overlay(value)
 
     def _ensure_canvas_script(self) -> None:
         if self._canvas_script_added:
@@ -268,7 +379,7 @@ class WebUI:
         self._canvas_script_added = True
 
     async def process_loop(self) -> None:
-        """Main processing loop with frame rate control."""
+        """Main processing loop with conditional segmentation."""
         print("[WebUI] Loop started")
         error_count = 0
 
@@ -284,19 +395,31 @@ class WebUI:
                         continue
 
                     error_count = 0
+                    self.frame_process_count += 1
 
-                    start_time = time.time()
-                    mask = self.model.inference(frame)
-                    inference_time = time.time() - start_time
+                    run_inference = (
+                        self.overlay_enabled
+                        and (
+                            self._force_segmentation
+                            or self.frame_process_count % self.segmentation_interval == 0
+                        )
+                    )
 
-                    self.monitor.update(inference_time)
+                    inference_time: float | None = None
+                    if run_inference:
+                        start_time = time.time()
+                        self.last_mask = self.model.inference(frame)
+                        inference_time = time.time() - start_time
+                        self._force_segmentation = False
+
+                    self.monitor.update(inference_time if run_inference else 0.0)
 
                     current_time = time.time()
                     time_since_last = current_time - self.last_send_time
 
                     if time_since_last >= self.min_send_interval:
-                        if self.overlay_enabled:
-                            display_frame = self.create_overlay(frame, mask)
+                        if self.overlay_enabled and self.last_mask is not None:
+                            display_frame = self.create_overlay(frame, self.last_mask)
                         else:
                             display_frame = frame
 
@@ -308,7 +431,10 @@ class WebUI:
                         if self.fps_label is not None:
                             self.fps_label.text = f"{stats['fps']:.1f}"
                         if self.inference_label is not None:
-                            self.inference_label.text = f"{stats['inference_ms']:.1f} ms"
+                            if self.overlay_enabled:
+                                self.inference_label.text = f"{stats['inference_ms']:.1f} ms"
+                            else:
+                                self.inference_label.text = "OFF"
                         if self.memory_label is not None:
                             self.memory_label.text = f"{stats['memory_mb']:.0f} MB"
                         if self.frames_label is not None:
@@ -341,22 +467,97 @@ class WebUI:
     async def send_frame(self, frame: np.ndarray) -> None:
         """Send frame to browser (optimized)."""
         if self.video_container is None:
-            print("[WebUI] ERROR: Video container not initialized")
             return
         try:
-            display_frame = cv2.resize(frame, (640, 480))
-            success, buffer = cv2.imencode(
-                ".jpg",
+            if frame.shape[1] == 640 and frame.shape[0] == 480:
+                display_frame = frame
+            else:
+                display_frame = cv2.resize(frame, (640, 480))
+
+            quality = min(95, max(50, int(self.jpeg_quality)))
+            img_base64 = await asyncio.to_thread(
+                self._encode_frame,
                 display_frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 75],
+                quality,
             )
-
-            if not success:
-                return
-
-            img_base64 = base64.b64encode(buffer).decode("utf-8")
-            await self.video_container.client.run_javascript(
-                f'window.updateVideoFrame("{img_base64}")'
+            await asyncio.wait_for(
+                self.video_container.client.run_javascript(
+                    f'window.updateVideoFrame("{img_base64}")'
+                ),
+                timeout=3.0,
             )
+        except asyncio.TimeoutError:
+            print("[WebUI] Send timeout (browser slow)")
         except Exception as exc:  # noqa: BLE001
-            print(f"[WebUI] Send error: {exc}")
+            if self.frame_send_count % 100 == 0:
+                print(f"[WebUI] Send error: {exc}")
+
+    def _encode_frame(self, frame: np.ndarray, quality: int) -> str:
+        params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+        success, buffer = cv2.imencode(".jpg", frame, params)
+        if not success:
+            raise RuntimeError("JPEG encoding failed")
+        raw_bytes = buffer.tobytes() if hasattr(buffer, "tobytes") else bytes(buffer)
+        return base64.b64encode(raw_bytes).decode("ascii")
+
+
+def _load_config(config_path: str) -> dict[str, Any]:
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {config_path}")
+    with path.open("r", encoding="utf-8") as cfg:
+        return yaml.safe_load(cfg)
+
+
+def _run_standalone() -> None:
+    import argparse
+
+    from benchmark import PerformanceMonitor
+    from camera import JetCamera
+    from segmentation import SegmentationModel
+
+    parser = argparse.ArgumentParser(description="Run WebUI standalone")
+    parser.add_argument("--config", default="configs/config.yaml", help="Path to config file")
+    parser.add_argument("--host", default="0.0.0.0", help="Host interface for NiceGUI")
+    parser.add_argument("--port", type=int, default=8080, help="Port for NiceGUI server")
+    args = parser.parse_args()
+
+    config = _load_config(args.config)
+    camera_cfg = config.get("camera", {})
+    model_cfg = config.get("model", {})
+    segmentation_cfg = config.get("segmentation", {})
+    display_cfg = config.get("display", {})
+
+    camera = JetCamera(
+        width=int(camera_cfg.get("width", 640)),
+        height=int(camera_cfg.get("height", 480)),
+        fps=int(camera_cfg.get("fps", 30)),
+        device=int(camera_cfg.get("device", 0)),
+    )
+
+    input_size = model_cfg.get("input_size", [camera_cfg.get("width", 640), camera_cfg.get("height", 480)])
+    model = SegmentationModel(
+        model_path=model_cfg.get("path", "models/dummy_segmentation_640x480.onnx"),
+        input_size=tuple(input_size),
+        road_classes=segmentation_cfg.get("road_classes", [0, 1]),
+    )
+
+    monitor = PerformanceMonitor()
+
+    if "interval" in segmentation_cfg and "segmentation_interval" not in display_cfg:
+        display_cfg["segmentation_interval"] = segmentation_cfg["interval"]
+
+    web_ui = WebUI(camera, model, monitor, display_cfg)
+    web_ui.setup_ui()
+
+    print("\n" + "=" * 60)
+    print("Web UI started!")
+    print(f"Access from browser: http://{args.host}:{args.port}")
+    print("Press Ctrl+C to stop")
+    print("=" * 60 + "\n")
+
+    ui.run(host=args.host, port=args.port, title="JetRacer Segmentation", reload=False, show=False)
+
+
+if __name__ == "__main__":
+    _run_standalone()
