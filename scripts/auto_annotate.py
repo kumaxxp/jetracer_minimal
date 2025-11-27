@@ -100,9 +100,13 @@ class AutoAnnotator:
         self.model.to(self.device)
         self.model.eval()
         
-        # Get ADE20K class names
-        self.ade20k_classes = self.processor.tokenizer.get_vocab()
-        self.id2label = {v: k for k, v in self.ade20k_classes.items()}
+        # Get ADE20K class names from model config (tokenizer vocab is unrelated)
+        config_id2label = self.model.config.id2label
+        # Some configs store keys as strings, so normalize to ints
+        self.id2label = {
+            int(k) if isinstance(k, str) and k.isdigit() else k: v
+            for k, v in config_id2label.items()
+        }
         
         print("✓ Model loaded successfully")
     
@@ -122,8 +126,8 @@ class AutoAnnotator:
             if ade20k_id >= len(self.id2label):
                 continue
             
-            # Get class name
-            class_name = self.id2label.get(ade20k_id, '')
+            # Get class name and normalize for mapping lookup
+            class_name = (self.id2label.get(ade20k_id, '') or '').lower().strip()
             
             # Map to JetRacer class
             jetracer_class = ADE20K_TO_JETRACER.get(class_name, 0)  # Default: Background
