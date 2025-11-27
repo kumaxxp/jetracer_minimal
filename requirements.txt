@@ -6,7 +6,7 @@ pyyaml
 
 # Web UI
 nicegui==1.4.33
-fastapi==0.109.0
+fastapi==0.109.1
 uvicorn[standard]==0.27.0
 
 # Benchmark

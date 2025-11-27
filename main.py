@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -33,6 +34,17 @@ def main() -> None:
         fps=config["camera"]["fps"],
         device=config["camera"]["device"],
     )
+
+    print("Starting camera...")
+    if not camera.start():
+        print("Failed to start camera")
+        sys.exit(1)
+
+    test_frame = camera.read()
+    if test_frame is None:
+        print("Camera test read failed")
+        sys.exit(1)
+    print(f"[Camera] Test successful: {test_frame.shape}")
 
     print("Loading segmentation model...")
     model = SegmentationModel(

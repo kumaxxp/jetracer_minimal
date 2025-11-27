@@ -3,3 +3,7 @@
 
 
 __pycache__/
+data/
+camera.py.backup.old
+web_ui.py.backup.script_fix
+models/deeplabv3_resnet50_640x480.onnx
