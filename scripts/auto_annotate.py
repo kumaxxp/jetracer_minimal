@@ -75,6 +75,7 @@ CLASS_COLORS = {
     0: (128, 128, 128),  # Background - Gray
     1: (0, 255, 0),      # Road - Green
     2: (0, 0, 255),      # Obstacle - Red
+    3: (64, 64, 64),     # Vehicle/対象外 - Dark Gray
 }
 
 
@@ -137,20 +138,20 @@ class AutoAnnotator:
         
         return jetracer_mask
     
-    def annotate_image(self, image_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    def annotate_image(self, image_path: Path, vehicle_mask: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Generate annotation for a single image.
         
         Args:
             image_path: Path to input image
-            
+            vehicle_mask: Optional np.ndarray, 1=vehicle, 0=not vehicle
         Returns:
             Tuple of (original_image, jetracer_mask)
         """
         # Load image
         image = Image.open(image_path).convert('RGB')
         image_np = np.array(image)
-        
+
         # Prepare inputs
         inputs = self.processor(
             images=image,
@@ -158,28 +159,40 @@ class AutoAnnotator:
             return_tensors="pt"
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
+
         # Inference
         with torch.no_grad():
             outputs = self.model(**inputs)
-        
+
         # Post-process
         predicted_semantic_map = self.processor.post_process_semantic_segmentation(
             outputs, target_sizes=[image.size[::-1]]
         )[0]
-        
+
         # Convert to numpy
         ade20k_mask = predicted_semantic_map.cpu().numpy().astype(np.uint8)
-        
+
         # Map to JetRacer classes
         jetracer_mask = self.map_ade20k_to_jetracer(ade20k_mask)
-        
+
+        # Apply vehicle mask: 車体領域は新クラス(3=対象外)に分類
+        if vehicle_mask is not None:
+            # 画像ごとにvehicle_maskをリサイズして適用
+            if vehicle_mask.shape != jetracer_mask.shape:
+                vehicle_mask = cv2.resize(vehicle_mask, (jetracer_mask.shape[1], jetracer_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            vehicle_mask = (vehicle_mask > 0).astype(np.uint8)
+            print('DEBUG: vehicle_mask > 0 count:', np.sum(vehicle_mask > 0))
+            jetracer_mask = jetracer_mask.copy()
+            jetracer_mask[vehicle_mask.astype(bool)] = 3
+            print('DEBUG: after mask assign, 3 count:', np.sum(jetracer_mask==3))
+
         return image_np, jetracer_mask
     
     def create_visualization(
         self,
         image: np.ndarray,
         mask: np.ndarray,
+        vehicle_mask: np.ndarray = None,
         alpha: float = 0.5
     ) -> np.ndarray:
         """
@@ -188,8 +201,8 @@ class AutoAnnotator:
         Args:
             image: Original image (H, W, 3)
             mask: Segmentation mask (H, W)
+            vehicle_mask: Optional, 1=vehicle, 0=not vehicle
             alpha: Overlay transparency
-            
         Returns:
             Visualization image (H, W, 3)
         """
@@ -197,10 +210,13 @@ class AutoAnnotator:
         colored_mask = np.zeros_like(image)
         for class_id, color in CLASS_COLORS.items():
             colored_mask[mask == class_id] = color
-        
+        # 車体領域を暗いグレーで強調
+        if vehicle_mask is not None:
+            if vehicle_mask.shape != mask.shape:
+                vehicle_mask = cv2.resize(vehicle_mask, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            colored_mask[vehicle_mask > 0] = (64, 64, 64)
         # Blend with original image
         vis = cv2.addWeighted(image, 1 - alpha, colored_mask, alpha, 0)
-        
         return vis
 
 
@@ -249,27 +265,55 @@ def process_images(
     }
     
     # Process each image
+    # vehicle_maskの自動推定: 画像パスの親ディレクトリにある `session_*` を探す
+    session_name = None
+    vehicle_mask_path = None
+    vehicle_mask = None
+    if image_files:
+        # find a parent directory that starts with 'session_' for the first image
+        first_img = image_files[0]
+        for p in first_img.parents:
+            if p.name.startswith('session_'):
+                session_name = p.name
+                break
+        if session_name:
+            vehicle_mask_path = Path(f"data/vehicle_masks/{session_name}.png")
+            if vehicle_mask_path.exists():
+                vehicle_mask = cv2.imread(str(vehicle_mask_path), cv2.IMREAD_GRAYSCALE)
+                # keep as 0/255 for now; will binarize per-image when applying
+            else:
+                print(f"[WARN] Vehicle mask not found: {vehicle_mask_path}")
+
     for idx, image_path in enumerate(image_files):
         try:
             print(f"Processing [{idx+1}/{len(image_files)}]: {image_path.name}")
-            
+            # 画像ごとにvehicle_maskをリサイズ
+            vmask = None
+            if vehicle_mask is not None:
+                img0 = cv2.imread(str(image_path))
+                h, w = img0.shape[:2]
+                vmask = cv2.resize(vehicle_mask, (w, h), interpolation=cv2.INTER_NEAREST)
             # Annotate
-            image, mask = annotator.annotate_image(image_path)
-            
+            image, mask = annotator.annotate_image(image_path, vmask)
             # Save mask
             mask_filename = image_path.stem + '_mask.png'
             mask_path = masks_dir / mask_filename
-            cv2.imwrite(str(mask_path), mask)
-            
+            from PIL import Image as PILImage
+            print('DEBUG: before save, unique:', np.unique(mask))
+            PILImage.fromarray(mask.astype(np.uint8)).save(str(mask_path))
+            mask2 = np.array(PILImage.open(str(mask_path)))
+            print('DEBUG: after save, unique:', np.unique(mask2))
             # Create visualization
             if visualize:
-                vis = annotator.create_visualization(image, mask)
+                vis = annotator.create_visualization(image, mask, vmask)
                 vis_filename = image_path.stem + '_vis.jpg'
                 vis_path = vis_dir / vis_filename
-                cv2.imwrite(str(vis_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-            
+                if vis.shape[2] == 3:
+                    vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+                else:
+                    vis_bgr = vis
+                cv2.imwrite(str(vis_path), vis_bgr)
             stats['processed'] += 1
-            
         except Exception as e:
             print(f"  Error: {e}")
             stats['failed'] += 1
