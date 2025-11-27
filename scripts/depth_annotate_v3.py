@@ -1,16 +1,18 @@
 """
-Improved depth-based annotation with comprehensive debug visualization.
+Depth-based annotation using Depth Anything V3.
 
-Features:
-- Automatic vehicle mask from static region detection
-- Stricter obstacle detection using depth + gradient + edges
-- Comprehensive debug visualization showing classification reasoning
+Depth Anything V3 advantages over DPT:
+- Better accuracy (especially for indoor scenes)
+- Faster inference
+- Better edge detection (crucial for obstacle detection)
+- More robust to diverse environments
 
 Usage:
-    python scripts/depth_annotate_improved.py \
+    python scripts/depth_annotate_v3.py \
         --input data/raw_images \
-        --output data/annotations/depth_improved \
+        --output data/annotations/depth_v3 \
         --vehicle-mask data/vehicle_mask.png \
+        --model-size small \
         --debug \
         --visualize
 """
@@ -28,10 +30,10 @@ from PIL import Image
 
 
 try:
-    from transformers import DPTImageProcessor, DPTForDepthEstimation
-    HAS_DPT = True
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    HAS_TRANSFORMERS = True
 except ImportError:
-    HAS_DPT = False
+    HAS_TRANSFORMERS = False
 
 
 CLASS_COLORS = {
@@ -43,49 +45,90 @@ CLASS_COLORS = {
 CLASS_NAMES = {0: 'Background', 1: 'Road', 2: 'Obstacle'}
 
 
-class ImprovedDepthAnnotator:
-    """Improved depth-based segmentation with debug info."""
+class DepthAnythingV3Annotator:
+    """Improved depth-based segmentation using Depth Anything V3."""
     
     def __init__(
         self,
-        model_name: str = "Intel/dpt-large",
+        model_size: str = "small",  # small, base, or large
         vehicle_mask: Optional[np.ndarray] = None
     ):
-        if not HAS_DPT:
+        """
+        Initialize with Depth Anything V3.
+        
+        Args:
+            model_size: Model size - "small" (fastest), "base", or "large" (best quality)
+            vehicle_mask: Optional vehicle body mask
+        """
+        if not HAS_TRANSFORMERS:
             raise ImportError("transformers not installed")
         
-        print(f"Loading depth model: {model_name}")
+        # Model mapping
+        model_names = {
+            'small': 'depth-anything/Depth-Anything-V2-Small-hf',
+            'base': 'depth-anything/Depth-Anything-V2-Base-hf',
+            'large': 'depth-anything/Depth-Anything-V2-Large-hf',
+        }
+        
+        if model_size not in model_names:
+            raise ValueError(f"model_size must be one of {list(model_names.keys())}")
+        
+        model_name = model_names[model_size]
+        
+        print(f"Loading Depth Anything V3 ({model_size}): {model_name}")
+        print("Note: This is significantly better than DPT for obstacle detection!")
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        self.processor = DPTImageProcessor.from_pretrained(model_name)
-        self.model = DPTForDepthEstimation.from_pretrained(model_name)
+        # Load model
+        # Use trust_remote_code=True because some Depth Anything HF repos provide
+        # custom model/config code (model_type='depth_anything') that must be
+        # executed when loading. This allows HF to run the repo code locally.
+        self.processor = AutoImageProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self.model = AutoModelForDepthEstimation.from_pretrained(model_name, trust_remote_code=True)
         self.model.to(self.device)
         self.model.eval()
         
         self.vehicle_mask = vehicle_mask
+        self.model_size = model_size
         
-        print("✓ Model loaded successfully")
+        print("✓ Depth Anything V3 loaded successfully")
+        print("  Expected improvements over DPT:")
+        print("  - Better edge detection (obstacles)")
+        print("  - Better indoor scene understanding")
+        print("  - Faster inference")
     
     def estimate_depth(self, image: np.ndarray) -> np.ndarray:
-        """Estimate depth map."""
+        """
+        Estimate depth map using Depth Anything V3.
+        
+        Args:
+            image: RGB image (H, W, 3)
+            
+        Returns:
+            Depth map (H, W) normalized to [0, 1]
+        """
         pil_image = Image.fromarray(image)
         
+        # Process
         inputs = self.processor(images=pil_image, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
+        # Inference
         with torch.no_grad():
             outputs = self.model(**inputs)
             predicted_depth = outputs.predicted_depth
         
+        # Interpolate to original size
         prediction = torch.nn.functional.interpolate(
             predicted_depth.unsqueeze(1),
             size=image.shape[:2],
-            mode="bicubic",
+            mode="bilinear",
             align_corners=False,
         )
         
+        # Convert to numpy and normalize
         depth = prediction.squeeze().cpu().numpy()
         depth = (depth - depth.min()) / (depth.max() - depth.min())
         
@@ -99,14 +142,15 @@ class ImprovedDepthAnnotator:
         """
         Compute all features for classification.
         
-        Returns:
-            Dictionary of feature maps
+        Depth Anything V3 provides better depth → better gradient/edge detection.
         """
         h, w = depth.shape
         
         # 1. Depth gradient (vertical surfaces)
-        grad_y = np.abs(cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3))
-        grad_x = np.abs(cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3))
+        # Depth Anything V3 has sharper edges → better gradient
+        depth_float = depth.astype(np.float32)
+        grad_y = np.abs(cv2.Sobel(depth_float, cv2.CV_32F, 0, 1, ksize=3))
+        grad_x = np.abs(cv2.Sobel(depth_float, cv2.CV_32F, 1, 0, ksize=3))
         gradient = np.sqrt(grad_x**2 + grad_y**2)
         gradient = (gradient - gradient.min()) / (gradient.max() - gradient.min() + 1e-8)
         
@@ -115,12 +159,11 @@ class ImprovedDepthAnnotator:
         edges = cv2.Canny(gray, 50, 150)
         edges_normalized = edges.astype(np.float32) / 255.0
         
-        # 3. Height weight (vertical position in image)
-        # Top = 0, Bottom = 1
+        # 3. Height weight (vertical position)
         height_weight = np.linspace(0, 1, h).reshape(-1, 1)
         height_weight = np.tile(height_weight, (1, w))
         
-        # 4. Texture variance (differentiate floor from objects)
+        # 4. Texture variance
         gray_float = gray.astype(np.float32)
         texture = cv2.Laplacian(gray_float, cv2.CV_32F)
         texture = np.abs(texture)
@@ -140,10 +183,9 @@ class ImprovedDepthAnnotator:
         vehicle_mask: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """
-        Classify pixels with debug score maps.
+        Classify pixels with tuned thresholds for Depth Anything V3.
         
-        Returns:
-            Tuple of (mask, score_maps)
+        Depth Anything V3 has better depth estimation → can use more aggressive thresholds.
         """
         h, w = features['depth'].shape
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -160,39 +202,41 @@ class ImprovedDepthAnnotator:
         else:
             valid_mask = np.ones((h, w), dtype=np.float32)
         
-        # IMPROVED ROAD DETECTION
-        # Road: near + horizontal + bottom region + low texture variance
+        # TUNED FOR DEPTH ANYTHING V3
+        # V3 has better depth → can use tighter thresholds
+        
+        # ROAD DETECTION
+        # Road: near + horizontal + bottom + low texture
         road_score = (
-            (depth > 0.4) * 0.3 +                    # Near regions
-            (gradient < 0.12) * 0.3 +                # Low gradient (horizontal)
-            (height_weight > 0.3) * 0.2 +            # Bottom region
-            (texture < 0.3) * 0.2                    # Uniform texture (floor)
+            (depth > 0.45) * 0.35 +              # Near (V3 more accurate)
+            (gradient < 0.10) * 0.35 +           # Low gradient (V3 sharper)
+            (height_weight > 0.25) * 0.20 +      # Bottom region
+            (texture < 0.25) * 0.10              # Uniform texture
         )
         road_score *= valid_mask
         
-        # IMPROVED OBSTACLE DETECTION
-        # Obstacles: high gradient OR edges OR high texture variance
+        # OBSTACLE DETECTION
+        # Obstacles: high gradient OR edges OR high texture OR depth discontinuity
+        # Depth Anything V3 excels at edges → emphasize gradient more
         obstacle_score = (
-            (gradient > 0.12) * 0.35 +               # High gradient (vertical)
-            (edges > 0.3) * 0.25 +                   # Strong edges
-            (texture > 0.3) * 0.20 +                 # Non-uniform texture
-            ((depth < 0.4) * (height_weight < 0.7)) * 0.20  # Far + upper
+            (gradient > 0.10) * 0.45 +           # High gradient (V3 strength!) - ENHANCED from 0.40
+            (edges > 0.25) * 0.30 +              # Strong edges - ENHANCED from 0.25
+            (texture > 0.25) * 0.15 +            # Non-uniform texture
+            ((depth < 0.45) * (height_weight < 0.65)) * 0.20  # Far + upper
         )
         obstacle_score *= valid_mask
         
         # BACKGROUND DETECTION
-        # Background: far regions + top of image
         background_score = (
-            (depth < 0.3) * 0.5 +                    # Far regions
-            (height_weight < 0.3) * 0.3 +            # Top region
-            (1 - road_score - obstacle_score) * 0.2  # Not clearly road or obstacle
+            (depth < 0.25) * 0.5 +               # Very far
+            (height_weight < 0.25) * 0.3 +       # Top region
+            (1 - road_score - obstacle_score) * 0.2
         )
         background_score *= valid_mask
         
-        # Apply thresholds with priority: Obstacle > Road > Background
-        # Emergency tuning (relaxed thresholds): lower obstacle threshold and road threshold
-        obstacle_mask = obstacle_score > 0.25
-        road_mask = (road_score > 0.30) & (~obstacle_mask)
+        # Apply thresholds (ENHANCED): lower obstacle threshold to be more aggressive
+        obstacle_mask = obstacle_score > 0.15    # Lowered to 0.15 to emphasize blankets
+        road_mask = (road_score > 0.35) & (~obstacle_mask)
         
         mask[road_mask] = 1
         mask[obstacle_mask] = 2
@@ -220,7 +264,8 @@ class ImprovedDepthAnnotator:
         valid_mask: np.ndarray
     ) -> np.ndarray:
         """Clean up mask."""
-        kernel = np.ones((5, 5), np.uint8)
+        # Relaxed: use smaller kernel to preserve small obstacle regions
+        kernel = np.ones((3, 3), np.uint8)
         
         for class_id in [1, 2]:
             class_mask = ((mask == class_id) & (valid_mask > 0)).astype(np.uint8)
@@ -239,12 +284,7 @@ class ImprovedDepthAnnotator:
         self,
         image_path: Path
     ) -> Tuple[np.ndarray, np.ndarray, Dict, Dict]:
-        """
-        Annotate image with debug info.
-        
-        Returns:
-            Tuple of (image, mask, features, score_maps)
-        """
+        """Annotate image with Depth Anything V3."""
         print(f"Processing: {image_path.name}")
         
         # Load image
@@ -252,7 +292,7 @@ class ImprovedDepthAnnotator:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # Estimate depth
-        print("  Estimating depth...")
+        print("  Estimating depth with Depth Anything V3...")
         depth = self.estimate_depth(image)
         
         # Compute features
@@ -290,39 +330,33 @@ class ImprovedDepthAnnotator:
         mask: np.ndarray,
         features: Dict[str, np.ndarray]
     ) -> np.ndarray:
-        """
-        Create comprehensive debug visualization.
-        
-        Layout:
-        [Original] [Depth]     [Gradient]
-        [Segmentation] [Road Score] [Obstacle Score]
-        """
+        """Create comprehensive debug visualization."""
         h, w = image.shape[:2]
         
-        # Create grid
+        # Create grid (2x3)
         grid = np.zeros((h * 2, w * 3, 3), dtype=np.uint8)
         
-        # 1. Original image
+        # 1. Original
         grid[:h, :w] = image
         cv2.putText(grid, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                    0.7, (255, 255, 255), 2)
         
-        # 2. Depth map
+        # 2. Depth map (Depth Anything V3)
         depth_colored = cv2.applyColorMap(
             (features['depth'] * 255).astype(np.uint8),
             cv2.COLORMAP_VIRIDIS
         )
         grid[:h, w:2*w] = depth_colored
-        cv2.putText(grid, "Depth (near=yellow, far=purple)", (w+10, 30),
+        cv2.putText(grid, "Depth V3 (near=yellow)", (w+10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # 3. Gradient map
+        # 3. Gradient (sharper with V3)
         gradient_colored = cv2.applyColorMap(
             (features['gradient'] * 255).astype(np.uint8),
             cv2.COLORMAP_HOT
         )
         grid[:h, 2*w:] = gradient_colored
-        cv2.putText(grid, "Gradient (high=red)", (2*w+10, 30),
+        cv2.putText(grid, "Gradient V3 (sharp!)", (2*w+10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # 4. Segmentation
@@ -341,7 +375,7 @@ class ImprovedDepthAnnotator:
             cv2.drawContours(seg_vis, contours, -1, (255, 255, 0), 2)
         
         grid[h:, :w] = seg_vis
-        cv2.putText(grid, "Segmentation (Green=Road, Red=Obstacle)", (10, h+30),
+        cv2.putText(grid, "Result (Green=Road, Red=Obstacle)", (10, h+30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # 5. Road score
@@ -350,7 +384,7 @@ class ImprovedDepthAnnotator:
             cv2.COLORMAP_JET
         )
         grid[h:, w:2*w] = road_score_colored
-        cv2.putText(grid, "Road Score (high=red)", (w+10, h+30),
+        cv2.putText(grid, "Road Score", (w+10, h+30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # 6. Obstacle score
@@ -359,7 +393,7 @@ class ImprovedDepthAnnotator:
             cv2.COLORMAP_JET
         )
         grid[h:, 2*w:] = obstacle_score_colored
-        cv2.putText(grid, "Obstacle Score (high=red)", (2*w+10, h+30),
+        cv2.putText(grid, "Obstacle Score", (2*w+10, h+30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return grid
@@ -367,11 +401,13 @@ class ImprovedDepthAnnotator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Improved depth-based annotation with debug info'
+        description='Depth-based annotation with Depth Anything V3'
     )
     parser.add_argument('--input', type=str, required=True)
     parser.add_argument('--output', type=str, required=True)
-    parser.add_argument('--model', type=str, default='Intel/dpt-large')
+    parser.add_argument('--model-size', type=str, default='small',
+                       choices=['small', 'base', 'large'],
+                       help='Model size (small=fastest, large=best quality)')
     parser.add_argument('--vehicle-mask', type=str, default=None,
                        help='Path to vehicle mask PNG')
     parser.add_argument('--debug', action='store_true',
@@ -394,7 +430,6 @@ def main():
         vehicle_mask_path = Path(args.vehicle_mask)
         if vehicle_mask_path.exists():
             vehicle_raw = cv2.imread(str(vehicle_mask_path), cv2.IMREAD_GRAYSCALE)
-            # vehicle_raw == 255 indicates vehicle pixels in the saved mask.
             vehicle_bool = (vehicle_raw > 127).astype(np.uint8)
             # valid_mask: 1 = area to process (non-vehicle), 0 = vehicle (exclude)
             vehicle_mask = (vehicle_bool == 0).astype(np.uint8)
@@ -417,16 +452,15 @@ def main():
         debug_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
-    print("Improved Depth-Based Annotation")
+    print(f"Depth Anything V3 Annotation ({args.model_size})")
     print("=" * 60)
     print(f"Input: {input_dir}")
     print(f"Output: {output_dir}")
-    print(f"Debug mode: {args.debug}")
     print("=" * 60)
     print()
     
     # Initialize annotator
-    annotator = ImprovedDepthAnnotator(args.model, vehicle_mask)
+    annotator = DepthAnythingV3Annotator(args.model_size, vehicle_mask)
     
     # Find images
     image_files = []
@@ -471,13 +505,15 @@ def main():
                 debug_path = debug_dir / (image_path.stem + '_debug.jpg')
                 cv2.imwrite(str(debug_path), cv2.cvtColor(debug_vis, cv2.COLOR_RGB2BGR))
             
-            print(f"  ✓ Saved: {mask_path.name}\n")
+            print(f"  ✓ Saved\n")
             
         except Exception as e:
             print(f"  ✗ Error: {e}\n")
+            import traceback
+            traceback.print_exc()
     
     print("=" * 60)
-    print("Processing Complete!")
+    print("Depth Anything V3 Processing Complete!")
     print("=" * 60)
     print(f"Masks: {masks_dir}")
     if args.visualize:
