@@ -25,6 +25,11 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
+import logging
+
+# Configure logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 
 # ADE20K class mapping to JetRacer classes
@@ -69,6 +74,11 @@ ADE20K_TO_JETRACER = {
     'windowpane, window': 0,
 }
 
+# ADE20K クラスのうち "rug/carpet/cushion/mat" 等は個別に保持して
+# ユーザが後で通過可能/不可を判断できるようにする
+PRESERVE_SYNONYMS = {
+    'rug', 'carpet', 'carpeting', 'cushion', 'mat'
+}
 
 # Colors for visualization
 CLASS_COLORS = {
@@ -89,11 +99,11 @@ class AutoAnnotator:
         Args:
             model_name: HuggingFace model name
         """
-        print(f"Loading model: {model_name}")
-        print("This may take a few minutes on first run...")
+        logger.info(f"Loading model: {model_name}")
+        logger.info("This may take a few minutes on first run...")
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
+        logger.info(f"Using device: {self.device}")
         
         # Load processor and model
         self.processor = OneFormerProcessor.from_pretrained(model_name)
@@ -108,8 +118,38 @@ class AutoAnnotator:
             int(k) if isinstance(k, str) and k.isdigit() else k: v
             for k, v in config_id2label.items()
         }
+        # Build synonym map from ADE20K_TO_JETRACER mapping keys.
+        # Keys may contain multiple comma-separated synonyms like 'carpet, carpeting, rug'.
+        self.synonym_map: Dict[str, int] = {}
+        for key, cls in ADE20K_TO_JETRACER.items():
+            parts = [p.strip().lower() for p in key.split(',') if p.strip()]
+            for p in parts:
+                self.synonym_map[p] = cls
+
+        # Preserve certain visual classes (so user can later mark passable or not)
+        # Assign unique labels for preserved ADE20K synonyms starting from 10
+        self.preserve_map: Dict[str, int] = {}
+        base_preserve_id = 10
+        for syn in sorted(PRESERVE_SYNONYMS):
+            if syn in self.synonym_map:
+                self.preserve_map[syn] = base_preserve_id
+                base_preserve_id += 1
+
+        # Build per-instance class color map starting from base CLASS_COLORS
+        self.class_colors = CLASS_COLORS.copy()
+        # Generate distinct colors for preserved classes
+        def gen_color(i, total):
+            import colorsys
+            h = i / max(total, 1)
+            r, g, b = colorsys.hsv_to_rgb(h, 0.7, 0.9)
+            return (int(r * 255), int(g * 255), int(b * 255))
+
+        if self.preserve_map:
+            total = len(self.preserve_map)
+            for idx, (syn, lid) in enumerate(self.preserve_map.items()):
+                self.class_colors[lid] = gen_color(idx, total)
         
-        print("✓ Model loaded successfully")
+        logger.info("✓ Model loaded successfully")
     
     def map_ade20k_to_jetracer(self, ade20k_mask: np.ndarray) -> np.ndarray:
         """
@@ -126,19 +166,39 @@ class AutoAnnotator:
         for ade20k_id in np.unique(ade20k_mask):
             if ade20k_id >= len(self.id2label):
                 continue
-            
+
             # Get class name and normalize for mapping lookup
             class_name = (self.id2label.get(ade20k_id, '') or '').lower().strip()
-            
-            # Map to JetRacer class
-            jetracer_class = ADE20K_TO_JETRACER.get(class_name, 0)  # Default: Background
-            
+
+            # Default
+            jetracer_class = 0
+
+            # 1) Preserve check (exact then fuzzy): if class matches a preserved synonym, assign preserved id
+            if class_name in self.preserve_map:
+                jetracer_class = self.preserve_map[class_name]
+            else:
+                # fuzzy match against preserve_map keys
+                for syn, pid in self.preserve_map.items():
+                    if syn in class_name or class_name in syn:
+                        jetracer_class = pid
+                        break
+
+            # 2) If not preserved, map to JetRacer via synonym_map (exact then fuzzy)
+            if jetracer_class == 0:
+                if class_name in self.synonym_map:
+                    jetracer_class = self.synonym_map[class_name]
+                else:
+                    for syn, cls in self.synonym_map.items():
+                        if syn in class_name or class_name in syn:
+                            jetracer_class = cls
+                            break
+
             # Apply mapping
             jetracer_mask[ade20k_mask == ade20k_id] = jetracer_class
         
         return jetracer_mask
     
-    def annotate_image(self, image_path: Path, vehicle_mask: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+    def annotate_image(self, image_path: Path, vehicle_mask: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Generate annotation for a single image.
         
@@ -181,12 +241,12 @@ class AutoAnnotator:
             if vehicle_mask.shape != jetracer_mask.shape:
                 vehicle_mask = cv2.resize(vehicle_mask, (jetracer_mask.shape[1], jetracer_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
             vehicle_mask = (vehicle_mask > 0).astype(np.uint8)
-            print('DEBUG: vehicle_mask > 0 count:', np.sum(vehicle_mask > 0))
+            logger.debug('vehicle_mask > 0 count: %d', int(np.sum(vehicle_mask > 0)))
             jetracer_mask = jetracer_mask.copy()
             jetracer_mask[vehicle_mask.astype(bool)] = 3
-            print('DEBUG: after mask assign, 3 count:', np.sum(jetracer_mask==3))
+            logger.debug('after mask assign, 3 count: %d', int(np.sum(jetracer_mask==3)))
 
-        return image_np, jetracer_mask
+        return image_np, jetracer_mask, ade20k_mask
     
     def create_visualization(
         self,
@@ -206,15 +266,10 @@ class AutoAnnotator:
         Returns:
             Visualization image (H, W, 3)
         """
-        # Create colored mask
+        # Create colored mask using per-instance colors (self.class_colors)
         colored_mask = np.zeros_like(image)
-        for class_id, color in CLASS_COLORS.items():
+        for class_id, color in self.class_colors.items():
             colored_mask[mask == class_id] = color
-        # 車体領域を暗いグレーで強調
-        if vehicle_mask is not None:
-            if vehicle_mask.shape != mask.shape:
-                vehicle_mask = cv2.resize(vehicle_mask, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-            colored_mask[vehicle_mask > 0] = (64, 64, 64)
         # Blend with original image
         vis = cv2.addWeighted(image, 1 - alpha, colored_mask, alpha, 0)
         return vis
@@ -294,15 +349,15 @@ def process_images(
                 h, w = img0.shape[:2]
                 vmask = cv2.resize(vehicle_mask, (w, h), interpolation=cv2.INTER_NEAREST)
             # Annotate
-            image, mask = annotator.annotate_image(image_path, vmask)
+            image, mask, ade20k_mask = annotator.annotate_image(image_path, vmask)
             # Save mask
             mask_filename = image_path.stem + '_mask.png'
             mask_path = masks_dir / mask_filename
             from PIL import Image as PILImage
-            print('DEBUG: before save, unique:', np.unique(mask))
+            logger.debug('before save, unique: %s', np.array2string(np.unique(mask)))
             PILImage.fromarray(mask.astype(np.uint8)).save(str(mask_path))
             mask2 = np.array(PILImage.open(str(mask_path)))
-            print('DEBUG: after save, unique:', np.unique(mask2))
+            logger.debug('after save, unique: %s', np.array2string(np.unique(mask2)))
             # Create visualization
             if visualize:
                 vis = annotator.create_visualization(image, mask, vmask)
@@ -313,6 +368,31 @@ def process_images(
                 else:
                     vis_bgr = vis
                 cv2.imwrite(str(vis_path), vis_bgr)
+            # Optionally save raw ADE20K mask + visualization if annotator has flag set
+            if getattr(annotator, 'save_ade20k', False):
+                try:
+                    ade_filename = image_path.stem + '_ade20k.png'
+                    ade_dir = output_dir / 'ade20k_masks'
+                    ade_dir.mkdir(parents=True, exist_ok=True)
+                    PILImage.fromarray(ade20k_mask.astype(np.uint8)).save(str(ade_dir / ade_filename))
+
+                    # ADE20K visualization: deterministic color per ADE id
+                    ade_vis = np.zeros_like(image)
+                    def ade_color(cid: int):
+                        import colorsys
+                        h = (cid % 150) / 150.0
+                        r, g, b = colorsys.hsv_to_rgb(h, 0.6, 0.9)
+                        return (int(r*255), int(g*255), int(b*255))
+
+                    for cid in np.unique(ade20k_mask):
+                        ade_vis[ade20k_mask == cid] = ade_color(int(cid))
+
+                    ade_vis_dir = output_dir / 'ade20k_visualizations'
+                    ade_vis_dir.mkdir(parents=True, exist_ok=True)
+                    ade_vis_bgr = cv2.cvtColor(ade_vis, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(str(ade_vis_dir / (image_path.stem + '_ade20k_vis.jpg')), ade_vis_bgr)
+                except Exception:
+                    logger.exception('Failed saving ADE20K outputs for %s', image_path.name)
             stats['processed'] += 1
         except Exception as e:
             print(f"  Error: {e}")
@@ -350,14 +430,17 @@ def main():
         action='store_true',
         help='Create visualization images'
     )
-    
+    parser.add_argument(
+        '--save-ade20k',
+        action='store_true',
+        help='Save raw ADE20K masks and ADE20K visualizations'
+    )
+
     args = parser.parse_args()
-    
+
     # Convert paths
     input_dir = Path(args.input)
     output_dir = Path(args.output)
-    
-    # Validate input
     if not input_dir.exists():
         print(f"Error: Input directory not found: {input_dir}")
         return 1
@@ -374,6 +457,8 @@ def main():
     
     # Initialize annotator
     annotator = AutoAnnotator(args.model)
+    # set flag to save ADE20K outputs if requested
+    annotator.save_ade20k = args.save_ade20k
     
     # Process images
     print()
