@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import colorsys
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -224,30 +225,45 @@ HTML_TEMPLATE = """
                 <button id="next-btn" onclick="navigate(1)">Next ▶</button>
             </div>
             <div class="legend">
-                <h3>Legend</h3>
+                <h3>Visualization</h3>
                 <div class="legend-item">
-                    <div class="legend-color legend-road"></div>
-                    <span>🟢 Road (Passable)</span>
-                </div>
-                <div class="legend-item">
-                    <div class="legend-color legend-obstacle"></div>
-                    <span>🔴 Obstacle (Avoid)</span>
+                    <div class="legend-color" style="background: linear-gradient(to right, #ff6b6b, #4ecdc4, #45b7d1, #f7b731);"></div>
+                    <span>🎨 ADE-colored segments</span>
                 </div>
                 <div class="legend-item">
                     <div class="legend-color legend-ignorable"></div>
-                    <span>▦ Ignorable (Can Touch)</span>
+                    <span>▦ ROAD (striped pattern)</span>
+                </div>
+                <div style="margin-top: 10px; font-size: 12px; color: #666;">
+                    <strong>How to use:</strong><br>
+                    1. Click on segment to toggle ROAD<br>
+                    2. ROAD segments get stripes<br>
+                    3. Changes apply to ALL images<br>
+                    4. Save to create mapping table
                 </div>
             </div>
         </div>
         <div class="right-panel">
-            <h2>Detected Objects</h2>
+            <h2>ROAD Labels</h2>
+            <div style="font-size: 13px; color: #666; margin-bottom: 15px; padding: 10px; background: #f8f8f8; border-radius: 4px;">
+                <strong>Click on segment</strong> to toggle ROAD status<br>
+                <em>ROAD labels show striped pattern</em><br>
+                <em>Changes apply to ALL images</em>
+            </div>
+            <div class="road-labels-list" id="road-labels-list"></div>
+            
+            <h3 style="margin-top: 30px;">All Labels in Current Image</h3>
             <div class="object-list" id="object-list"></div>
             <div class="shortcuts">
                 <h3>⌨️ Keyboard Shortcuts</h3>
-                <div><strong>Space:</strong> Toggle selected object</div>
+                <div><strong>Space:</strong> Toggle impassable ⇄ ignorable</div>
                 <div><strong>→:</strong> Next image</div>
                 <div><strong>←:</strong> Previous image</div>
                 <div><strong>S:</strong> Save</div>
+                <div style="margin-top: 8px; font-size: 11px; color: #888;">
+                    💡 Tip: Checked = Impassable (must avoid)<br>
+                    💡 Unchecked = Ignorable (can touch)
+                </div>
             </div>
         </div>
     </div>
@@ -255,8 +271,8 @@ HTML_TEMPLATE = """
     <script>
         let currentIndex = 0;
         let images = [];
-        let currentObjects = [];
-        let selectedObjectId = null;
+        let currentLabels = [];
+        let roadLabels = [];
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d');
 
@@ -274,7 +290,6 @@ HTML_TEMPLATE = """
             if (index < 0 || index >= images.length) return;
             
             currentIndex = index;
-            selectedObjectId = null;
             
             // Update UI
             document.getElementById('image-name').textContent = images[index];
@@ -295,9 +310,10 @@ HTML_TEMPLATE = """
             };
             img.src = data.image_url;
             
-            // Load objects
-            currentObjects = data.objects;
-            renderObjectList();
+            // Store labels
+            currentLabels = data.labels;
+            roadLabels = data.road_labels;
+            renderLabelLists();
         }
 
         // Draw image with overlays
@@ -310,7 +326,7 @@ HTML_TEMPLATE = """
                 // Draw overlay
                 const overlayImg = new Image();
                 overlayImg.onload = () => {
-                    ctx.globalAlpha = 0.5;
+                    ctx.globalAlpha = 0.6;
                     ctx.drawImage(overlayImg, 0, 0);
                     ctx.globalAlpha = 1.0;
                 };
@@ -319,64 +335,63 @@ HTML_TEMPLATE = """
             img.src = data.image_url;
         }
 
-        // Render object list
-        function renderObjectList() {
-            const list = document.getElementById('object-list');
-            list.innerHTML = '';
+        // Render label lists
+        function renderLabelLists() {
+            // Render ROAD labels list
+            const roadList = document.getElementById('road-labels-list');
+            roadList.innerHTML = '';
             
-            currentObjects.forEach((obj, idx) => {
+            if (roadLabels.length === 0) {
+                roadList.innerHTML = '<div style="color: #999; font-style: italic;">No ROAD labels yet. Click on segments to add.</div>';
+            } else {
+                roadLabels.forEach(label => {
+                    const item = document.createElement('div');
+                    item.className = 'road-label-item';
+                    item.style.cssText = 'padding: 8px; margin-bottom: 4px; background: #e8f5e9; border-left: 3px solid #4CAF50; cursor: pointer;';
+                    item.onclick = () => toggleADELabel(label.ade_id);
+                    item.innerHTML = `
+                        <div style="font-weight: bold;">▦ ${label.label}</div>
+                        <div style="font-size: 11px; color: #666;">ADE-${label.ade_id} • Click to remove</div>
+                    `;
+                    roadList.appendChild(item);
+                });
+            }
+            
+            // Render all labels in current image
+            const objectList = document.getElementById('object-list');
+            objectList.innerHTML = '';
+            
+            currentLabels.forEach(label => {
                 const item = document.createElement('div');
-                item.className = 'object-item' + 
-                    (obj.enabled ? '' : ' disabled') +
-                    (selectedObjectId === obj.id ? ' selected' : '');
-                item.onclick = () => selectObject(obj.id);
+                item.className = 'object-item';
+                item.style.cssText = 'padding: 10px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer;';
+                if (label.is_road) {
+                    item.style.background = '#e8f5e9';
+                    item.style.borderColor = '#4CAF50';
+                }
+                item.onclick = () => toggleADELabel(label.ade_id);
                 
-                const info = document.createElement('div');
-                info.className = 'object-info';
+                const badge = label.is_road ? '▦' : '⬛';
+                const status = label.is_road ? 'ROAD' : 'Obstacle';
                 
-                const name = document.createElement('div');
-                name.className = 'object-name';
-                name.textContent = obj.label;
-                
-                const stats = document.createElement('div');
-                stats.className = 'object-stats';
-                stats.textContent = `${obj.percentage.toFixed(1)}% • ${obj.pixels} px`;
-                
-                info.appendChild(name);
-                info.appendChild(stats);
-                
-                const toggle = document.createElement('div');
-                toggle.className = 'toggle-switch' + (obj.enabled ? ' active' : '');
-                toggle.onclick = (e) => {
-                    e.stopPropagation();
-                    toggleObject(obj.id);
-                };
-                
-                const slider = document.createElement('div');
-                slider.className = 'slider';
-                toggle.appendChild(slider);
-                
-                item.appendChild(info);
-                item.appendChild(toggle);
-                list.appendChild(item);
+                item.innerHTML = `
+                    <div style="font-weight: bold;">${badge} ${label.label}</div>
+                    <div style="font-size: 12px; color: #666;">${label.percentage.toFixed(1)}% • ADE-${label.ade_id} • ${status}</div>
+                `;
+                objectList.appendChild(item);
             });
         }
 
-        // Select object
-        function selectObject(id) {
-            selectedObjectId = id;
-            renderObjectList();
-        }
-
-        // Toggle object enabled/disabled
-        async function toggleObject(id) {
-            const response = await fetch(`/api/toggle/${currentIndex}/${id}`, {
+        // Toggle ADE label
+        async function toggleADELabel(adeId) {
+            const response = await fetch(`/api/toggle/${adeId}`, {
                 method: 'POST'
             });
             const data = await response.json();
-            currentObjects = data.objects;
-            renderObjectList();
-            loadImage(currentIndex); // Refresh visualization
+            roadLabels = data.road_labels;
+            
+            // Reload current image to update visualization
+            loadImage(currentIndex);
         }
 
         // Navigation
@@ -395,8 +410,8 @@ HTML_TEMPLATE = """
 
         // Reset
         async function reset() {
-            if (confirm('Reset all changes for this image?')) {
-                const response = await fetch(`/api/reset/${currentIndex}`, {
+            if (confirm('Reset ALL ROAD mappings? This affects the entire dataset.')) {
+                const response = await fetch(`/api/reset`, {
                     method: 'POST'
                 });
                 loadImage(currentIndex);
@@ -412,8 +427,8 @@ HTML_TEMPLATE = """
             const response = await fetch(`/api/pick/${currentIndex}/${x}/${y}`);
             const data = await response.json();
             
-            if (data.object_id !== null) {
-                selectObject(data.object_id);
+            if (data.ade_id !== null && data.ade_id !== undefined) {
+                toggleADELabel(data.ade_id);
             }
         });
 
@@ -423,12 +438,12 @@ HTML_TEMPLATE = """
                 navigate(1);
             } else if (e.key === 'ArrowLeft') {
                 navigate(-1);
-            } else if (e.key === ' ' && selectedObjectId !== null) {
-                e.preventDefault();
-                toggleObject(selectedObjectId);
             } else if (e.key === 's' || e.key === 'S') {
                 e.preventDefault();
                 save();
+            } else if (e.key === 'r' || e.key === 'R') {
+                e.preventDefault();
+                reset();
             }
         });
 
@@ -441,10 +456,118 @@ HTML_TEMPLATE = """
 
 
 class InteractiveAnnotationTool:
-    """Interactive web-based annotation tool."""
+    """
+    Interactive ADE20K to JetRacer Mapping Tool.
+    
+    Purpose: Create consistent ADE20K → ROAD mapping across entire dataset.
+    
+    Workflow:
+    1. Display image with ADE-colored segmentation
+    2. User clicks on segment to toggle ROAD classification
+    3. Clicked ADE label becomes ROAD for ALL images
+    4. Striped pattern shows ROAD segments
+    5. Right panel shows list of ROAD labels
+    6. Save ADE20K_TO_JETRACER mapping table
+    """
+    
+    # ADE20K common labels (subset of 150 classes)
+    ADE20K_LABELS = {
+        1: 'wall',
+        3: 'floor',
+        4: 'ceiling',
+        5: 'door',
+        7: 'table',
+        8: 'windowpane',
+        10: 'chair',
+        11: 'car',
+        12: 'person',
+        13: 'curtain',
+        14: 'painting',
+        15: 'sofa',
+        16: 'bed',
+        18: 'cabinet',
+        19: 'desk',
+        22: 'armchair',
+        23: 'seat',
+        24: 'fence',
+        25: 'pillow',
+        28: 'rug',
+        29: 'lamp',
+        30: 'bathtub',
+        31: 'railing',
+        32: 'cushion',
+        33: 'box',
+        34: 'column',
+        35: 'signboard',
+        36: 'chest of drawers',
+        37: 'counter',
+        38: 'sink',
+        39: 'fireplace',
+        40: 'refrigerator',
+        41: 'stairs',
+        42: 'escalator',
+        43: 'bookcase',
+        44: 'book',
+        45: 'blind',
+        46: 'shelf',
+        47: 'stairway',
+        48: 'ottoman',
+        49: 'bottle',
+        50: 'buffet',
+        51: 'poster',
+        52: 'stage',
+        53: 'van',
+        54: 'ship',
+        55: 'fountain',
+        56: 'awning',
+        57: 'streetlight',
+        58: 'truck',
+        59: 'tower',
+        60: 'chandelier',
+        61: 'canopy',
+        62: 'washer',
+        63: 'plaything',
+        64: 'pool table',
+        65: 'stool',
+        66: 'barrel',
+        67: 'basket',
+        68: 'bag',
+        69: 'minibike',
+        70: 'cradle',
+        71: 'oven',
+        72: 'ball',
+        73: 'food',
+        74: 'step',
+        75: 'tank',
+        76: 'trade name',
+        77: 'microwave',
+        78: 'pot',
+        79: 'animal',
+        80: 'bicycle',
+        81: 'dishwasher',
+        82: 'screen',
+        83: 'blanket',
+        84: 'sculpture',
+        85: 'hood',
+        86: 'sconce',
+        87: 'vase',
+        88: 'traffic light',
+        89: 'tray',
+        90: 'ashcan',
+        91: 'fan',
+        92: 'pier',
+        93: 'screen door',
+        94: 'plate',
+        95: 'monitor',
+        96: 'bulletin board',
+        97: 'shower',
+        98: 'radiator',
+        99: 'glass',
+        100: 'clock',
+    }
     
     def __init__(self, session_dir: Path):
-        # Resolve session path to an absolute path so file I/O is stable
+        # Resolve session path to absolute so file I/O is stable regardless of CWD
         self.session_dir = Path(session_dir).resolve()
         self.masks_dir = self.session_dir / 'masks'
         self.images_dir = self.session_dir.parent.parent.parent / 'raw_images' / self.session_dir.name
@@ -456,44 +579,64 @@ class InteractiveAnnotationTool:
         # Load images
         self.image_files = sorted(list(self.images_dir.glob('*.jpg')))
         
-        # Load or initialize metadata
-        self.metadata_path = self.output_dir / 'metadata.json'
-        self.metadata = self._load_metadata()
+        # Load or initialize ADE20K → ROAD mapping
+        self.mapping_path = self.output_dir / 'ade_to_road_mapping.json'
+        self.ade_to_road = self._load_mapping()
+        
+        # Detect all ADE labels in dataset
+        self.all_ade_labels = self._detect_all_ade_labels()
         
         print(f"Loaded session: {self.session_dir.name}")
         print(f"Found {len(self.image_files)} images")
+        print(f"Detected {len(self.all_ade_labels)} unique ADE labels")
     
-    def _load_metadata(self) -> Dict:
-        """Load existing metadata or create new."""
-        if self.metadata_path.exists():
-            with open(self.metadata_path) as f:
-                return json.load(f)
-        else:
-            # Initialize metadata for all images
-            metadata = {}
-            for img_file in self.image_files:
-                metadata[img_file.stem] = {
-                    'objects': {},  # object_id -> enabled
-                    'modified': False
-                }
-            return metadata
-    
-    def save_metadata(self):
-        """Save metadata to disk."""
-        with open(self.metadata_path, 'w') as f:
-            json.dump(self.metadata, f, indent=2)
-        print(f"Saved metadata: {self.metadata_path}")
-    
-    def get_objects(self, image_index: int) -> List[Dict]:
+    def _load_mapping(self) -> Dict[int, bool]:
         """
-        Get detected objects for an image.
+        Load ADE20K → ROAD mapping.
         
-        Returns list of objects with:
-        - id: unique identifier
+        Returns:
+            Dict[ade_id, is_road]
+            - True: This ADE label is ROAD
+            - False: This ADE label is Obstacle
+        """
+        if self.mapping_path.exists():
+            with open(self.mapping_path) as f:
+                data = json.load(f)
+                # Convert string keys back to int
+                return {int(k): v for k, v in data.items()}
+        else:
+            return {}
+    
+    def _detect_all_ade_labels(self) -> List[int]:
+        """Detect all unique ADE labels across entire dataset."""
+        all_labels = set()
+        
+        for img_file in self.image_files:
+            ade_mask_path = self.ade_masks_dir / (img_file.stem + '_ade20k.png')
+            if ade_mask_path.exists():
+                ade_mask = cv2.imread(str(ade_mask_path), cv2.IMREAD_GRAYSCALE)
+                all_labels.update(np.unique(ade_mask).tolist())
+        
+        return sorted(list(all_labels))
+    
+    def save_mapping(self):
+        """Save ADE20K → ROAD mapping to disk."""
+        with open(self.mapping_path, 'w') as f:
+            json.dump(self.ade_to_road, f, indent=2)
+        print(f"Saved mapping: {self.mapping_path}")
+        print(f"  ROAD labels: {sum(self.ade_to_road.values())}")
+        print(f"  Obstacle labels: {len(self.ade_to_road) - sum(self.ade_to_road.values())}")
+    
+    def get_ade_labels_in_image(self, image_index: int) -> List[Dict]:
+        """
+        Get ADE labels present in current image.
+        
+        Returns list with:
+        - ade_id: ADE20K class ID
         - label: ADE20K class name
         - pixels: number of pixels
         - percentage: percentage of image
-        - enabled: whether this is a valid obstacle
+        - is_road: whether this label is classified as ROAD
         """
         img_file = self.image_files[image_index]
         
@@ -501,100 +644,142 @@ class InteractiveAnnotationTool:
         ade_mask_path = self.ade_masks_dir / (img_file.stem + '_ade20k.png')
         ade_mask = cv2.imread(str(ade_mask_path), cv2.IMREAD_GRAYSCALE)
         
-        # Load JetRacer mask
-        jr_mask_path = self.masks_dir / (img_file.stem + '_mask.png')
-        jr_mask = cv2.imread(str(jr_mask_path), cv2.IMREAD_GRAYSCALE)
-        
-        # Get unique ADE IDs (excluding Road which is class 1 in JetRacer)
-        objects = []
+        # Get unique ADE IDs
+        labels = []
         for ade_id in np.unique(ade_mask):
-            # Only consider pixels that are NOT Road in JetRacer classification
-            obj_pixels = (ade_mask == ade_id) & (jr_mask != 1)
-            pixel_count = np.sum(obj_pixels)
+            pixel_count = np.sum(ade_mask == ade_id)
             
             if pixel_count > 100:  # Minimum size threshold
-                obj_id = f"ade_{ade_id}"
+                # Check if this label is ROAD
+                is_road = self.ade_to_road.get(int(ade_id), False)
                 
-                # Get enabled status from metadata
-                if img_file.stem not in self.metadata:
-                    self.metadata[img_file.stem] = {'objects': {}, 'modified': False}
+                # Get label name
+                label_name = self.ADE20K_LABELS.get(int(ade_id), f"Unknown-{ade_id}")
                 
-                if obj_id not in self.metadata[img_file.stem]['objects']:
-                    # Default: enabled (treat as obstacle)
-                    self.metadata[img_file.stem]['objects'][obj_id] = True
-                
-                enabled = self.metadata[img_file.stem]['objects'][obj_id]
-                
-                objects.append({
-                    'id': obj_id,
+                labels.append({
                     'ade_id': int(ade_id),
-                    'label': f"ADE-{ade_id}",  # Could map to actual names
+                    'label': label_name,
                     'pixels': int(pixel_count),
                     'percentage': float(pixel_count / ade_mask.size * 100),
-                    'enabled': enabled
+                    'is_road': is_road
                 })
         
         # Sort by pixel count
-        objects.sort(key=lambda x: x['pixels'], reverse=True)
+        labels.sort(key=lambda x: x['pixels'], reverse=True)
         
-        return objects
+        return labels
+    
+    def get_road_labels(self) -> List[Dict]:
+        """
+        Get all ADE labels that are classified as ROAD.
+        
+        Returns list for display in right panel.
+        """
+        road_labels = []
+        
+        for ade_id, is_road in self.ade_to_road.items():
+            if is_road:
+                label_name = self.ADE20K_LABELS.get(ade_id, f"Unknown-{ade_id}")
+                road_labels.append({
+                    'ade_id': ade_id,
+                    'label': label_name
+                })
+        
+        # Sort by name
+        road_labels.sort(key=lambda x: x['label'])
+        
+        return road_labels
+    
+    def toggle_road_label(self, ade_id: int):
+        """
+        Toggle ADE label between ROAD and Obstacle.
+        
+        This affects ALL images in the dataset.
+        """
+        current = self.ade_to_road.get(ade_id, False)
+        self.ade_to_road[ade_id] = not current
+        
+        label_name = self.ADE20K_LABELS.get(ade_id, f"Unknown-{ade_id}")
+        status = "ROAD" if not current else "Obstacle"
+        print(f"Toggled {label_name} (ADE-{ade_id}) → {status}")
+    
+    def _ade_id_to_color(self, ade_id: int) -> Tuple[int, int, int]:
+        """
+        Convert ADE20K ID to unique color using HSV.
+        
+        Returns RGB color tuple.
+        """
+        # Use HSV to generate distinct colors
+        import colorsys
+        
+        # Map ADE ID to hue (0-360 degrees)
+        hue = (ade_id * 137.508) % 360  # Golden angle for better distribution
+        saturation = 0.7
+        value = 0.9
+        
+        # Convert HSV to RGB
+        r, g, b = colorsys.hsv_to_rgb(hue / 360.0, saturation, value)
+        
+        return (int(b * 255), int(g * 255), int(r * 255))  # BGR for OpenCV
     
     def create_overlay(self, image_index: int) -> np.ndarray:
         """
         Create overlay visualization.
         
-        Colors:
-        - Green (alpha): Road
-        - Red (alpha): Enabled obstacles
-        - Yellow stripes: Disabled obstacles (ignorable)
+        Display:
+        - ADE-colored segmentation for all labels
+        - Striped pattern overlay for ROAD labels
+        
+        Logic:
+        - All segments: ADE-specific unique color
+        - ROAD segments: Add white stripes on top
+        - Non-ROAD segments: Just ADE color
         """
         img_file = self.image_files[image_index]
         
-        # Load masks
-        jr_mask = cv2.imread(str(self.masks_dir / (img_file.stem + '_mask.png')), cv2.IMREAD_GRAYSCALE)
-        ade_mask = cv2.imread(str(self.ade_masks_dir / (img_file.stem + '_ade20k.png')), cv2.IMREAD_GRAYSCALE)
+        # Load ADE mask
+        ade_mask_path = self.ade_masks_dir / (img_file.stem + '_ade20k.png')
+        ade_mask = cv2.imread(str(ade_mask_path), cv2.IMREAD_GRAYSCALE)
         
-        h, w = jr_mask.shape
+        h, w = ade_mask.shape
+        overlay = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Get all ADE labels in this image
+        labels = self.get_ade_labels_in_image(image_index)
+        
+        for label in labels:
+            ade_id = label['ade_id']
+            # Get pixels for this ADE label
+            mask = (ade_mask == ade_id)
+            # Get unique color for this ADE ID (BGR)
+            color = self._ade_id_to_color(ade_id)
+            # Apply color to overlay
+            overlay[mask] = color
 
-        # Build ADE20K color map for obstacle visualization (match auto_annotate_decisive)
-        ade_color = {}
-        for uid in np.unique(ade_mask):
-            hval = (int(uid) * 37) % 180
-            hsv = np.uint8([[[hval, 200, 200]]])
-            bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0].tolist()
-            ade_color[int(uid)] = tuple(int(x) for x in bgr)
+        # Blend overlay with original image so ADE colors are visible on top of photo
+        img_bgr = cv2.imread(str(img_file))
+        if img_bgr is None:
+            return overlay
 
-        # Create colored mask (BGR)
-        colored_mask = np.zeros((h, w, 3), dtype=np.uint8)
-        # Background: gray
-        colored_mask[jr_mask == 0] = (128, 128, 128)
-        # Road: green
-        colored_mask[jr_mask == 1] = (0, 255, 0)
-        # Obstacle: color by ADE20K id
-        obstacle_idx = (jr_mask == 2)
-        for uid, col in ade_color.items():
-            colored_mask[np.logical_and(obstacle_idx, ade_mask == uid)] = col
+        vis = cv2.addWeighted(img_bgr, 0.5, overlay, 0.5, 0)
 
-        # Load original image and blend (image is RGB when loaded via PIL earlier; load BGR here)
-        img_file = self.image_files[image_index]
-        image_bgr = cv2.imread(str(img_file))
-        if image_bgr is None:
-            # Fallback: return colored mask if image not found
-            return colored_mask
+        # Draw black horizontal stripe pattern for ROAD labels on top of blended image
+        stripe_width = 8
+        stripe_gap = 12
+        stripe_period = stripe_width + stripe_gap
+        for label in labels:
+            ade_id = label['ade_id']
+            is_road = label['is_road']
+            if not is_road:
+                continue
+            mask = (ade_mask == ade_id)
+            for y in range(h):
+                if ((y // stripe_period) % 2) == 0:
+                    cols = np.where(mask[y])[0]
+                    if cols.size:
+                        vis[y, cols] = (0, 0, 0)
 
-        vis_bgr = cv2.addWeighted(image_bgr, 0.5, colored_mask, 0.5, 0)
-
-        # Note: vehicle mask contour drawing is optional; if a vehicle mask exists in session, draw it
-        vehicle_mask_path = self.session_dir.parent.parent / 'vehicle_mask.png'
-        if vehicle_mask_path.exists():
-            vm = cv2.imread(str(vehicle_mask_path), cv2.IMREAD_GRAYSCALE)
-            if vm is not None:
-                vm_resized = cv2.resize(vm, (vis_bgr.shape[1], vis_bgr.shape[0]))
-                contours, _ = cv2.findContours((vm_resized > 127).astype('uint8'), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    cv2.drawContours(vis_bgr, contours, -1, (255, 255, 0), 2)
-
-        return vis_bgr
+        return vis
 
 
 # Flask app
@@ -620,12 +805,14 @@ def api_session():
 @app.route('/api/image/<int:index>')
 def api_image(index):
     img_file = tool.image_files[index]
-    objects = tool.get_objects(index)
+    labels = tool.get_ade_labels_in_image(index)
+    road_labels = tool.get_road_labels()
     
     return jsonify({
         'image_url': f'/image/{index}',
         'overlay_url': f'/overlay/{index}',
-        'objects': objects
+        'labels': labels,
+        'road_labels': road_labels
     })
 
 
@@ -636,40 +823,29 @@ def serve_image(index):
 
 @app.route('/overlay/<int:index>')
 def serve_overlay(index):
-    # If a precomputed visualization exists (matches auto_annotate output), serve it.
-    img_file = tool.image_files[index]
-    vis_dir = tool.session_dir.parent / 'visualizations'
-    vis_path = vis_dir / (img_file.stem + '_vis.jpg')
-    if vis_path.exists():
-        return send_file(vis_path)
-
-    # Otherwise, generate overlay on the fly
     overlay = tool.create_overlay(index)
-
+    
     # Save to temp file
     temp_path = tool.output_dir / f'temp_overlay_{index}.png'
-    cv2.imwrite(str(temp_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-
+    # Overlay is already in BGR order (see _ade_id_to_color), write directly
+    cv2.imwrite(str(temp_path), overlay)
+    
     return send_file(temp_path)
 
 
-@app.route('/api/toggle/<int:index>/<object_id>', methods=['POST'])
-def api_toggle(index, object_id):
-    img_file = tool.image_files[index]
-    
-    # Toggle
-    current = tool.metadata[img_file.stem]['objects'][object_id]
-    tool.metadata[img_file.stem]['objects'][object_id] = not current
-    tool.metadata[img_file.stem]['modified'] = True
+@app.route('/api/toggle/<int:ade_id>', methods=['POST'])
+def api_toggle(ade_id):
+    """Toggle ADE label between ROAD and Obstacle."""
+    tool.toggle_road_label(ade_id)
     
     return jsonify({
-        'objects': tool.get_objects(index)
+        'road_labels': tool.get_road_labels()
     })
 
 
 @app.route('/api/pick/<int:index>/<int:x>/<int:y>')
 def api_pick(index, x, y):
-    """Pick object at pixel coordinates."""
+    """Pick ADE label at pixel coordinates."""
     img_file = tool.image_files[index]
     
     # Load ADE mask
@@ -678,32 +854,21 @@ def api_pick(index, x, y):
     
     # Get ADE ID at pixel
     ade_id = int(ade_mask[y, x])
-    object_id = f"ade_{ade_id}"
     
-    # Check if this object exists
-    objects = tool.get_objects(index)
-    for obj in objects:
-        if obj['id'] == object_id:
-            return jsonify({'object_id': object_id})
-    
-    return jsonify({'object_id': None})
+    return jsonify({'ade_id': ade_id})
 
 
 @app.route('/api/save', methods=['POST'])
 def api_save():
-    tool.save_metadata()
-    return jsonify({'message': 'Metadata saved successfully!'})
+    tool.save_mapping()
+    return jsonify({'message': 'ADE20K → ROAD mapping saved successfully!'})
 
 
-@app.route('/api/reset/<int:index>', methods=['POST'])
-def api_reset(index):
-    img_file = tool.image_files[index]
-    
-    # Reset to default (all enabled)
-    tool.metadata[img_file.stem]['objects'] = {}
-    tool.metadata[img_file.stem]['modified'] = False
-    
-    return jsonify({'message': 'Reset successfully'})
+@app.route('/api/reset', methods=['POST'])
+def api_reset():
+    """Reset all mappings."""
+    tool.ade_to_road = {}
+    return jsonify({'message': 'All mappings reset', 'road_labels': []})
 
 
 def main():
